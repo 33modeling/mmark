@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -36,8 +37,11 @@ import (
 
 var version = "dev"
 
-//go:embed assets/github-markdown.css
-var githubCSS string
+//go:embed assets/github-markdown-light.css
+var githubLightCSS string
+
+//go:embed assets/github-markdown-dark.css
+var githubDarkCSS string
 
 //go:embed assets/help.md
 var helpMD string
@@ -72,9 +76,12 @@ var pageTmpl = template.Must(template.New("page").Parse(`<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{.Title}} · mmark</title>
-<style>{{.CSS}}</style>
+<style>{{.BaseCSS}}</style>
+<style id="css-light" media="{{.LightMedia}}">{{.LightCSS}}</style>
+<style id="css-dark" media="{{.DarkMedia}}">{{.DarkCSS}}</style>
 </head>
 <body>
+<button id="theme-toggle" type="button">🌗</button>
 <article class="markdown-body">{{.Body}}</article>
 <script>
 (function () {
@@ -88,6 +95,27 @@ var pageTmpl = template.Must(template.New("page").Parse(`<!doctype html>
   addEventListener("pagehide", function () {
     navigator.sendBeacon("/__mmark/bye");
   });
+
+  var THEMES = ["auto", "light", "dark"];
+  var ICONS = { auto: "🌗", light: "☀️", dark: "🌙" };
+  var LABELS = { auto: "자동", light: "라이트", dark: "다크" };
+  var theme = {{.Theme}};
+  var btn = document.getElementById("theme-toggle");
+  function apply(t) {
+    var l = document.getElementById("css-light");
+    var d = document.getElementById("css-dark");
+    if (t === "light") { l.media = "all"; d.media = "not all"; }
+    else if (t === "dark") { l.media = "not all"; d.media = "all"; }
+    else { l.media = "(prefers-color-scheme: light)"; d.media = "(prefers-color-scheme: dark)"; }
+    btn.textContent = ICONS[t];
+    btn.title = "테마: " + LABELS[t] + " (클릭하면 전환)";
+  }
+  btn.addEventListener("click", function () {
+    theme = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
+    apply(theme);
+    fetch("/__mmark/theme?set=" + theme, { method: "POST" }).catch(function () {});
+  });
+  apply(theme);
 })();
 </script>
 </body>
@@ -95,18 +123,28 @@ var pageTmpl = template.Must(template.New("page").Parse(`<!doctype html>
 `))
 
 type pageData struct {
-	Title string
-	CSS   template.CSS
-	Body  template.HTML
-	Stamp string
-	Path  string
+	Title      string
+	BaseCSS    template.CSS
+	LightCSS   template.CSS
+	DarkCSS    template.CSS
+	LightMedia string
+	DarkMedia  string
+	Theme      string
+	Body       template.HTML
+	Stamp      string
+	Path       string
 }
 
 type server struct {
 	baseDir  string // absolute, cleaned
 	mainFile string // absolute; "" in help mode
-	css      template.CSS
+	baseCSS  template.CSS
+	lightCSS template.CSS
+	darkCSS  template.CSS
 	fs       http.Handler
+
+	mu    sync.RWMutex
+	theme string // "auto" | "light" | "dark"
 }
 
 func main() {
@@ -115,7 +153,12 @@ func main() {
 		return
 	}
 
-	s := &server{css: template.CSS(buildCSS())}
+	s := &server{
+		baseCSS:  template.CSS(baseCSS),
+		lightCSS: template.CSS(buildThemeCSS("github", githubLightCSS)),
+		darkCSS:  template.CSS(buildThemeCSS("github-dark", githubDarkCSS)),
+		theme:    loadTheme(),
+	}
 	if len(os.Args) > 1 {
 		abs, err := filepath.Abs(os.Args[1])
 		if err != nil {
@@ -136,6 +179,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/__mmark/status", s.status)
 	mux.HandleFunc("/__mmark/bye", s.bye)
+	mux.HandleFunc("/__mmark/theme", s.setTheme)
 	mux.HandleFunc("/", s.root)
 
 	lastPoll.Store(time.Now().UnixNano())
@@ -218,15 +262,76 @@ func (s *server) renderMarkdown(w http.ResponseWriter, urlPath, title string, sr
 		template.HTMLEscape(&buf, []byte(err.Error()))
 		buf.WriteString("</pre>")
 	}
+	s.mu.RLock()
+	theme := s.theme
+	s.mu.RUnlock()
+	lightMedia, darkMedia := themeMedia(theme)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	pageTmpl.Execute(w, pageData{
-		Title: title,
-		CSS:   s.css,
-		Body:  template.HTML(buf.String()),
-		Stamp: stamp,
-		Path:  urlPath,
+		Title:      title,
+		BaseCSS:    s.baseCSS,
+		LightCSS:   s.lightCSS,
+		DarkCSS:    s.darkCSS,
+		LightMedia: lightMedia,
+		DarkMedia:  darkMedia,
+		Theme:      theme,
+		Body:       template.HTML(buf.String()),
+		Stamp:      stamp,
+		Path:       urlPath,
 	})
+}
+
+func themeMedia(theme string) (light, dark string) {
+	switch theme {
+	case "light":
+		return "all", "not all"
+	case "dark":
+		return "not all", "all"
+	}
+	return "(prefers-color-scheme: light)", "(prefers-color-scheme: dark)"
+}
+
+func validTheme(t string) bool {
+	return t == "auto" || t == "light" || t == "dark"
+}
+
+func themeFile() string {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "mmark", "theme")
+}
+
+func loadTheme() string {
+	if p := themeFile(); p != "" {
+		if b, err := os.ReadFile(p); err == nil {
+			if t := strings.TrimSpace(string(b)); validTheme(t) {
+				return t
+			}
+		}
+	}
+	return "auto"
+}
+
+// setTheme stores the user's theme choice; persisting it under the OS config
+// dir keeps it across runs even though the port (= web origin) changes.
+func (s *server) setTheme(w http.ResponseWriter, r *http.Request) {
+	t := r.URL.Query().Get("set")
+	if !validTheme(t) {
+		http.Error(w, "invalid theme", http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	s.theme = t
+	s.mu.Unlock()
+	if p := themeFile(); p != "" {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err == nil {
+			os.WriteFile(p, []byte(t), 0o644)
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // status reports the current stamp of the polled file and doubles as the
@@ -269,19 +374,26 @@ func decodeText(b []byte) string {
 	return string(b)
 }
 
-func buildCSS() string {
-	var b strings.Builder
-	b.WriteString(`body{margin:0;background:#fff}
-@media (prefers-color-scheme: dark){body{background:#0d1117}}
-.markdown-body{box-sizing:border-box;min-width:200px;max-width:980px;margin:0 auto;padding:45px}
+const baseCSS = `.markdown-body{box-sizing:border-box;min-width:200px;max-width:980px;margin:0 auto;padding:45px}
 @media (max-width: 767px){.markdown-body{padding:15px}}
-`)
-	b.WriteString(githubCSS)
+#theme-toggle{position:fixed;top:12px;right:12px;z-index:10;width:38px;height:38px;border-radius:50%;border:1px solid rgba(128,128,128,.4);background:rgba(128,128,128,.12);cursor:pointer;font-size:18px;line-height:1;padding:0;opacity:.55}
+#theme-toggle:hover{opacity:1}
+@media print{#theme-toggle{display:none}}
+`
+
+// buildThemeCSS combines one github-markdown-css variant with the matching
+// chroma style; the two results are toggled via <style media=...> switching.
+func buildThemeCSS(chromaStyle, markdownCSS string) string {
+	var b strings.Builder
+	if strings.Contains(chromaStyle, "dark") {
+		b.WriteString("body{margin:0;background:#0d1117}\n")
+	} else {
+		b.WriteString("body{margin:0;background:#fff}\n")
+	}
+	b.WriteString(markdownCSS)
+	b.WriteString("\n")
 	f := chromahtml.New(chromahtml.WithClasses(true))
-	f.WriteCSS(&b, styles.Get("github"))
-	b.WriteString("\n@media (prefers-color-scheme: dark) {\n")
-	f.WriteCSS(&b, styles.Get("github-dark"))
-	b.WriteString("}\n")
+	f.WriteCSS(&b, styles.Get(chromaStyle))
 	return b.String()
 }
 
