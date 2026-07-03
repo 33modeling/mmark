@@ -1,6 +1,6 @@
 module github.com/33modeling/mmark
 
-go 1.26.4
+go 1.25.0
 
 require (
 	github.com/alecthomas/chroma/v2 v2.27.0

@@ -8,7 +8,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -23,16 +25,20 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	chromahtml "github.com/alecthomas/chroma/v2/formatters/html"
 	"github.com/alecthomas/chroma/v2/styles"
 	"github.com/yuin/goldmark"
 	highlighting "github.com/yuin/goldmark-highlighting/v2"
+	"github.com/yuin/goldmark/ast"
 	"github.com/yuin/goldmark/extension"
 	"github.com/yuin/goldmark/parser"
 	ghtml "github.com/yuin/goldmark/renderer/html"
+	"golang.org/x/text/encoding"
 	"golang.org/x/text/encoding/korean"
+	textunicode "golang.org/x/text/encoding/unicode"
 )
 
 var version = "dev"
@@ -51,12 +57,24 @@ const (
 	// minute, so the idle timeout has to be generous or a backgrounded
 	// tab would kill the server.
 	idleTimeout = 10 * time.Minute
-	// After a pagehide beacon, wait this long for a follow-up poll (page
-	// reload / navigation) before shutting down.
-	byeGrace = 10 * time.Second
+	// The watchdog only exits after this many consecutive over-deadline
+	// checks, so a browser that just woke from suspend or heavy tab
+	// throttling gets time to re-establish polling.
+	idleMisses = 5
 )
 
-var lastPoll atomic.Int64
+var (
+	lastPoll atomic.Int64
+	errSeq   atomic.Int64
+)
+
+// scriptNonce lets the page's own script run under a CSP that blocks any
+// script embedded in the markdown document itself.
+var scriptNonce = func() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}()
 
 var md = goldmark.New(
 	goldmark.WithExtensions(
@@ -69,6 +87,38 @@ var md = goldmark.New(
 	goldmark.WithParserOptions(parser.WithAutoHeadingID()),
 	goldmark.WithRendererOptions(ghtml.WithUnsafe()),
 )
+
+// gitHubIDs generates heading anchors the way GitHub does — keeping unicode
+// letters — instead of goldmark's ASCII-only default, which collapses
+// all-Korean headings to "-", "--1", ... and breaks in-document TOC links.
+type gitHubIDs struct{ used map[string]bool }
+
+func newGitHubIDs() parser.IDs { return &gitHubIDs{used: map[string]bool{}} }
+
+func (g *gitHubIDs) Generate(value []byte, kind ast.NodeKind) []byte {
+	var sb strings.Builder
+	for _, r := range strings.ToLower(string(value)) {
+		switch {
+		case unicode.IsLetter(r) || unicode.IsNumber(r) || r == '_' || r == '-':
+			sb.WriteRune(r)
+		case r == ' ':
+			sb.WriteRune('-')
+		}
+	}
+	id := sb.String()
+	if id == "" {
+		id = "heading"
+	}
+	base, n := id, 1
+	for g.used[id] {
+		id = fmt.Sprintf("%s-%d", base, n)
+		n++
+	}
+	g.used[id] = true
+	return []byte(id)
+}
+
+func (g *gitHubIDs) Put(value []byte) { g.used[string(value)] = true }
 
 var pageTmpl = template.Must(template.New("page").Parse(`<!doctype html>
 <html lang="ko">
@@ -83,7 +133,7 @@ var pageTmpl = template.Must(template.New("page").Parse(`<!doctype html>
 <body>
 <button id="theme-toggle" type="button">🌗</button>
 <article class="markdown-body">{{.Body}}</article>
-<script>
+<script nonce="{{.Nonce}}">
 (function () {
   var stamp = {{.Stamp}};
   var statusURL = "/__mmark/status?p=" + encodeURIComponent({{.Path}});
@@ -92,10 +142,6 @@ var pageTmpl = template.Must(template.New("page").Parse(`<!doctype html>
       if (j.stamp !== stamp) location.reload();
     }).catch(function () {});
   }, 1000);
-  addEventListener("pagehide", function () {
-    navigator.sendBeacon("/__mmark/bye");
-  });
-
   var THEMES = ["auto", "light", "dark"];
   var ICONS = { auto: "🌗", light: "☀️", dark: "🌙" };
   var LABELS = { auto: "자동", light: "라이트", dark: "다크" };
@@ -130,6 +176,7 @@ type pageData struct {
 	LightMedia string
 	DarkMedia  string
 	Theme      string
+	Nonce      string
 	Body       template.HTML
 	Stamp      string
 	Path       string
@@ -148,6 +195,7 @@ type server struct {
 }
 
 func main() {
+	attachConsole() // no-op outside Windows; makes stdout/stderr reach the shell despite -H windowsgui
 	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
 		fmt.Println("mmark", version)
 		return
@@ -162,8 +210,7 @@ func main() {
 	if len(os.Args) > 1 {
 		abs, err := filepath.Abs(os.Args[1])
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "mmark:", err)
-			os.Exit(1)
+			fatal(err.Error())
 		}
 		s.mainFile = abs
 		s.baseDir = filepath.Dir(abs)
@@ -172,31 +219,56 @@ func main() {
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "mmark:", err)
-		os.Exit(1)
+		fatal(err.Error())
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/__mmark/status", s.status)
-	mux.HandleFunc("/__mmark/bye", s.bye)
 	mux.HandleFunc("/__mmark/theme", s.setTheme)
 	mux.HandleFunc("/", s.root)
 
 	lastPoll.Store(time.Now().UnixNano())
-	go func() {
-		for {
-			time.Sleep(2 * time.Second)
-			if time.Since(time.Unix(0, lastPoll.Load())) > idleTimeout {
-				os.Exit(0)
-			}
-		}
-	}()
+	go watchdog()
 
 	openBrowser("http://" + ln.Addr().String() + "/")
 	if err := http.Serve(ln, mux); err != nil {
-		fmt.Fprintln(os.Stderr, "mmark:", err)
-		os.Exit(1)
+		fatal(err.Error())
 	}
+}
+
+// watchdog exits the process once no browser tab has polled for a while.
+// It never trusts a single measurement: lastPoll is wall-clock, so waking
+// from a >idleTimeout system suspend looks like idleness even though a tab
+// is still open. A wall-clock jump between ticks therefore resets the
+// window, and shutdown additionally requires idleMisses consecutive
+// over-deadline checks.
+func watchdog() {
+	const tick = 2 * time.Second
+	misses := 0
+	prev := time.Now()
+	for {
+		time.Sleep(tick)
+		now := time.Now()
+		if now.Round(0).Sub(prev.Round(0)) > 5*tick { // Round strips the monotonic reading
+			lastPoll.Store(now.UnixNano())
+			misses = 0
+		}
+		prev = now
+		if time.Since(time.Unix(0, lastPoll.Load())) > idleTimeout {
+			misses++
+			if misses >= idleMisses {
+				os.Exit(0)
+			}
+		} else {
+			misses = 0
+		}
+	}
+}
+
+func fatal(msg string) {
+	fmt.Fprintln(os.Stderr, "mmark:", msg)
+	fatalUI("mmark: " + msg)
+	os.Exit(1)
 }
 
 // resolve maps a URL path to an absolute file path, confined to baseDir.
@@ -209,7 +281,13 @@ func (s *server) resolve(urlPath string) (string, bool) {
 	}
 	rel := strings.TrimPrefix(path.Clean(urlPath), "/")
 	p := filepath.Join(s.baseDir, filepath.FromSlash(rel))
-	if p == s.baseDir || strings.HasPrefix(p, s.baseDir+string(filepath.Separator)) {
+	// baseDir may already end in a separator (drive roots like `E:\`, UNC
+	// share roots, or `/`) — don't blindly append another one.
+	prefix := s.baseDir
+	if !strings.HasSuffix(prefix, string(filepath.Separator)) {
+		prefix += string(filepath.Separator)
+	}
+	if p == s.baseDir || strings.HasPrefix(p, prefix) {
 		return p, true
 	}
 	return "", false
@@ -247,8 +325,17 @@ func (s *server) root(w http.ResponseWriter, r *http.Request) {
 func (s *server) renderFile(w http.ResponseWriter, urlPath, file string) {
 	raw, err := os.ReadFile(file)
 	if err != nil {
+		// If the file exists but the read failed (e.g. a Windows sharing
+		// violation while an editor saves), stamp the error page with a
+		// one-off value so the next poll mismatches and retries. A truly
+		// missing file keeps its real stamp ("gone") and stays stable
+		// until the file appears.
+		stamp := fileStamp(file)
+		if _, serr := os.Stat(file); serr == nil {
+			stamp = fmt.Sprintf("retry-%d", errSeq.Add(1))
+		}
 		src := fmt.Sprintf("# 파일을 열 수 없습니다\n\n```\n%s\n```\n", err)
-		s.renderMarkdown(w, urlPath, filepath.Base(file), []byte(src), fileStamp(file))
+		s.renderMarkdown(w, urlPath, filepath.Base(file), []byte(src), stamp)
 		return
 	}
 	s.renderMarkdown(w, urlPath, filepath.Base(file), []byte(decodeText(raw)), fileStamp(file))
@@ -256,7 +343,8 @@ func (s *server) renderFile(w http.ResponseWriter, urlPath, file string) {
 
 func (s *server) renderMarkdown(w http.ResponseWriter, urlPath, title string, src []byte, stamp string) {
 	var buf bytes.Buffer
-	if err := md.Convert(src, &buf); err != nil {
+	ctx := parser.NewContext(parser.WithIDs(newGitHubIDs()))
+	if err := md.Convert(src, &buf, parser.WithContext(ctx)); err != nil {
 		buf.Reset()
 		buf.WriteString("<h1>렌더링 오류</h1><pre>")
 		template.HTMLEscape(&buf, []byte(err.Error()))
@@ -268,6 +356,14 @@ func (s *server) renderMarkdown(w http.ResponseWriter, urlPath, title string, sr
 	lightMedia, darkMedia := themeMedia(theme)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	// Raw HTML in the document is rendered (WithUnsafe), so a CSP keeps
+	// scripts inside untrusted .md files from running on this origin and
+	// reading the served directory; only our nonce'd page script may run.
+	w.Header().Set("Content-Security-Policy",
+		"default-src 'none'; img-src * data: blob:; media-src * data:; "+
+			"style-src 'unsafe-inline'; script-src 'nonce-"+scriptNonce+"'; "+
+			"connect-src 'self'; base-uri 'none'; form-action 'none'")
 	pageTmpl.Execute(w, pageData{
 		Title:      title,
 		BaseCSS:    s.baseCSS,
@@ -276,6 +372,7 @@ func (s *server) renderMarkdown(w http.ResponseWriter, urlPath, title string, sr
 		LightMedia: lightMedia,
 		DarkMedia:  darkMedia,
 		Theme:      theme,
+		Nonce:      scriptNonce,
 		Body:       template.HTML(buf.String()),
 		Stamp:      stamp,
 		Path:       urlPath,
@@ -346,13 +443,6 @@ func (s *server) status(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"stamp": stamp})
 }
 
-// bye rewinds the heartbeat so the process exits shortly after the last tab
-// closes; an immediate poll from a reload/navigation cancels it.
-func (s *server) bye(w http.ResponseWriter, r *http.Request) {
-	lastPoll.Store(time.Now().Add(byeGrace - idleTimeout).UnixNano())
-	w.WriteHeader(http.StatusNoContent)
-}
-
 func fileStamp(p string) string {
 	st, err := os.Stat(p)
 	if err != nil {
@@ -361,9 +451,24 @@ func fileStamp(p string) string {
 	return fmt.Sprintf("%d-%d", st.ModTime().UnixNano(), st.Size())
 }
 
-// decodeText assumes UTF-8 and falls back to CP949/EUC-KR, the legacy
-// encoding of Korean Windows text files.
+// decodeText assumes UTF-8 and falls back to the legacy encodings of Korean
+// Windows text files: UTF-16 with BOM (old Notepad "유니코드", PowerShell 5.1
+// redirection) and CP949/EUC-KR.
 func decodeText(b []byte) string {
+	if len(b) >= 2 {
+		var enc encoding.Encoding
+		switch {
+		case b[0] == 0xFF && b[1] == 0xFE:
+			enc = textunicode.UTF16(textunicode.LittleEndian, textunicode.ExpectBOM)
+		case b[0] == 0xFE && b[1] == 0xFF:
+			enc = textunicode.UTF16(textunicode.BigEndian, textunicode.ExpectBOM)
+		}
+		if enc != nil {
+			if d, err := enc.NewDecoder().Bytes(b); err == nil {
+				return string(d)
+			}
+		}
+	}
 	b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
 	if utf8.Valid(b) {
 		return string(b)
