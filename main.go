@@ -9,13 +9,15 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
-	_ "embed"
+	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"mime"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -51,6 +53,9 @@ var githubDarkCSS string
 
 //go:embed assets/help.md
 var helpMD string
+
+//go:embed assets/app.js assets/mermaid.min.js assets/katex.min.js assets/katex-auto-render.min.js assets/katex.min.css assets/katex/fonts/*
+var staticAssets embed.FS
 
 const (
 	// Browsers throttle timers in hidden tabs down to about once per
@@ -126,44 +131,35 @@ var pageTmpl = template.Must(template.New("page").Parse(`<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{.Title}} · mmark</title>
+<link rel="stylesheet" href="/__mmark/assets/katex.min.css">
 <style>{{.BaseCSS}}</style>
 <style id="css-light" media="{{.LightMedia}}">{{.LightCSS}}</style>
 <style id="css-dark" media="{{.DarkMedia}}">{{.DarkCSS}}</style>
 </head>
 <body>
-<button id="theme-toggle" type="button">🌗</button>
+<div id="controls">
+{{if .CanPick}}<button id="open-file" type="button" title="파일 열기">📂</button>{{end}}
+<button id="toc-toggle" type="button" title="목차" hidden>☰</button>
+<button id="search-open" type="button" title="검색">🔎</button>
+<button id="print-doc" type="button" title="인쇄/PDF">🖨</button>
+<button id="theme-toggle" type="button" title="테마">🌗</button>
+</div>
+<nav id="toc" aria-label="문서 목차" hidden></nav>
+<div id="search-panel" hidden>
+  <input id="search-input" type="search" placeholder="검색" autocomplete="off" spellcheck="false">
+  <span id="search-count">0/0</span>
+  <button id="search-prev" type="button" title="이전">↑</button>
+  <button id="search-next" type="button" title="다음">↓</button>
+  <button id="search-close" type="button" title="닫기">×</button>
+</div>
 <article class="markdown-body">{{.Body}}</article>
 <script nonce="{{.Nonce}}">
-(function () {
-  var stamp = {{.Stamp}};
-  var statusURL = "/__mmark/status?p=" + encodeURIComponent({{.Path}});
-  setInterval(function () {
-    fetch(statusURL).then(function (r) { return r.json(); }).then(function (j) {
-      if (j.stamp !== stamp) location.reload();
-    }).catch(function () {});
-  }, 1000);
-  var THEMES = ["auto", "light", "dark"];
-  var ICONS = { auto: "🌗", light: "☀️", dark: "🌙" };
-  var LABELS = { auto: "자동", light: "라이트", dark: "다크" };
-  var theme = {{.Theme}};
-  var btn = document.getElementById("theme-toggle");
-  function apply(t) {
-    var l = document.getElementById("css-light");
-    var d = document.getElementById("css-dark");
-    if (t === "light") { l.media = "all"; d.media = "not all"; }
-    else if (t === "dark") { l.media = "not all"; d.media = "all"; }
-    else { l.media = "(prefers-color-scheme: light)"; d.media = "(prefers-color-scheme: dark)"; }
-    btn.textContent = ICONS[t];
-    btn.title = "테마: " + LABELS[t] + " (클릭하면 전환)";
-  }
-  btn.addEventListener("click", function () {
-    theme = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
-    apply(theme);
-    fetch("/__mmark/theme?set=" + theme, { method: "POST" }).catch(function () {});
-  });
-  apply(theme);
-})();
+window.__MMARK__ = { stamp: {{.Stamp}}, path: {{.Path}}, theme: {{.Theme}} };
 </script>
+<script nonce="{{.Nonce}}" src="/__mmark/assets/katex.min.js"></script>
+<script nonce="{{.Nonce}}" src="/__mmark/assets/katex-auto-render.min.js"></script>
+<script nonce="{{.Nonce}}" src="/__mmark/assets/mermaid.min.js"></script>
+<script nonce="{{.Nonce}}" src="/__mmark/assets/app.js"></script>
 </body>
 </html>
 `))
@@ -180,6 +176,7 @@ type pageData struct {
 	Body       template.HTML
 	Stamp      string
 	Path       string
+	CanPick    bool
 }
 
 type server struct {
@@ -190,8 +187,8 @@ type server struct {
 	darkCSS  template.CSS
 	fs       http.Handler
 
-	mu    sync.RWMutex
-	theme string // "auto" | "light" | "dark"
+	mu    sync.RWMutex // guards the mutable fields above and theme
+	theme string       // "auto" | "light" | "dark"
 }
 
 func main() {
@@ -207,14 +204,19 @@ func main() {
 		darkCSS:  template.CSS(buildThemeCSS("github-dark", githubDarkCSS)),
 		theme:    loadTheme(),
 	}
+
+	fileArg := ""
 	if len(os.Args) > 1 {
-		abs, err := filepath.Abs(os.Args[1])
+		fileArg = os.Args[1]
+	} else if p, ok := chooseMarkdownFile(); ok {
+		fileArg = p
+	}
+	if fileArg != "" {
+		abs, err := filepath.Abs(fileArg)
 		if err != nil {
 			fatal(err.Error())
 		}
-		s.mainFile = abs
-		s.baseDir = filepath.Dir(abs)
-		s.fs = http.FileServer(http.Dir(s.baseDir))
+		s.openFile(abs)
 	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -223,6 +225,9 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/__mmark/assets/", serveAsset)
+	mux.HandleFunc("/__mmark/open", s.openRecent)
+	mux.HandleFunc("/__mmark/pick", s.pickFile)
 	mux.HandleFunc("/__mmark/status", s.status)
 	mux.HandleFunc("/__mmark/theme", s.setTheme)
 	mux.HandleFunc("/", s.root)
@@ -271,8 +276,52 @@ func fatal(msg string) {
 	os.Exit(1)
 }
 
+func serveAsset(w http.ResponseWriter, r *http.Request) {
+	rel := path.Clean("/" + strings.TrimPrefix(r.URL.Path, "/__mmark/assets/"))
+	if rel == "/" {
+		http.NotFound(w, r)
+		return
+	}
+	name := "assets" + rel
+	b, err := staticAssets.ReadFile(name)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if ct := mime.TypeByExtension(path.Ext(name)); ct != "" {
+		w.Header().Set("Content-Type", ct)
+	}
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	http.ServeContent(w, r, path.Base(name), time.Time{}, bytes.NewReader(b))
+}
+
+func (s *server) openFile(file string) {
+	file = filepath.Clean(file)
+	s.mu.Lock()
+	s.mainFile = file
+	s.baseDir = filepath.Dir(file)
+	s.fs = http.FileServer(http.Dir(s.baseDir))
+	s.mu.Unlock()
+	rememberRecentFile(file)
+}
+
+func (s *server) hasMainFile() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.mainFile != ""
+}
+
+func (s *server) fileServer() http.Handler {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.fs
+}
+
 // resolve maps a URL path to an absolute file path, confined to baseDir.
 func (s *server) resolve(urlPath string) (string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if urlPath == "/" {
 		return s.mainFile, s.mainFile != ""
 	}
@@ -301,13 +350,35 @@ func isMarkdown(p string) bool {
 	return false
 }
 
+func (s *server) openRecent(w http.ResponseWriter, r *http.Request) {
+	p := r.URL.Query().Get("p")
+	abs, err := filepath.Abs(p)
+	if err != nil || !isMarkdown(abs) || !knownRecentFile(abs) {
+		http.Error(w, "invalid recent file", http.StatusBadRequest)
+		return
+	}
+	s.openFile(abs)
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func (s *server) pickFile(w http.ResponseWriter, r *http.Request) {
+	p, ok := chooseMarkdownFile()
+	if ok {
+		abs, err := filepath.Abs(p)
+		if err == nil {
+			s.openFile(abs)
+		}
+	}
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
 func (s *server) root(w http.ResponseWriter, r *http.Request) {
-	if s.mainFile == "" {
+	if !s.hasMainFile() {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
 			return
 		}
-		s.renderMarkdown(w, "/", "mmark", []byte(helpMD), "help")
+		s.renderMarkdown(w, "/", "mmark", []byte(helpSource()), "help")
 		return
 	}
 	p, ok := s.resolve(r.URL.Path)
@@ -319,7 +390,11 @@ func (s *server) root(w http.ResponseWriter, r *http.Request) {
 		s.renderFile(w, r.URL.Path, p)
 		return
 	}
-	s.fs.ServeHTTP(w, r)
+	if fs := s.fileServer(); fs != nil {
+		fs.ServeHTTP(w, r)
+		return
+	}
+	http.NotFound(w, r)
 }
 
 func (s *server) renderFile(w http.ResponseWriter, urlPath, file string) {
@@ -361,8 +436,8 @@ func (s *server) renderMarkdown(w http.ResponseWriter, urlPath, title string, sr
 	// scripts inside untrusted .md files from running on this origin and
 	// reading the served directory; only our nonce'd page script may run.
 	w.Header().Set("Content-Security-Policy",
-		"default-src 'none'; img-src * data: blob:; media-src * data:; "+
-			"style-src 'unsafe-inline'; script-src 'nonce-"+scriptNonce+"'; "+
+		"default-src 'none'; img-src * data: blob:; media-src * data:; font-src 'self' data:; "+
+			"style-src 'self' 'unsafe-inline'; script-src 'nonce-"+scriptNonce+"'; "+
 			"connect-src 'self'; base-uri 'none'; form-action 'none'")
 	pageTmpl.Execute(w, pageData{
 		Title:      title,
@@ -376,6 +451,7 @@ func (s *server) renderMarkdown(w http.ResponseWriter, urlPath, title string, sr
 		Body:       template.HTML(buf.String()),
 		Stamp:      stamp,
 		Path:       urlPath,
+		CanPick:    canChooseMarkdownFile(),
 	})
 }
 
@@ -401,6 +477,14 @@ func themeFile() string {
 	return filepath.Join(dir, "mmark", "theme")
 }
 
+func recentFile() string {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "mmark", "recent.json")
+}
+
 func loadTheme() string {
 	if p := themeFile(); p != "" {
 		if b, err := os.ReadFile(p); err == nil {
@@ -410,6 +494,124 @@ func loadTheme() string {
 		}
 	}
 	return "auto"
+}
+
+type recentState struct {
+	Files []string `json:"files"`
+}
+
+var recentMu sync.Mutex
+
+func cleanRecentPath(p string) string {
+	if p == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return ""
+	}
+	return filepath.Clean(abs)
+}
+
+func samePath(a, b string) bool {
+	a, b = filepath.Clean(a), filepath.Clean(b)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
+}
+
+func loadRecentFiles() []string {
+	p := recentFile()
+	if p == "" {
+		return nil
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return nil
+	}
+	var st recentState
+	if err := json.Unmarshal(b, &st); err != nil {
+		return nil
+	}
+	files := make([]string, 0, len(st.Files))
+	for _, f := range st.Files {
+		f = cleanRecentPath(f)
+		if f == "" || !isMarkdown(f) {
+			continue
+		}
+		dup := false
+		for _, existing := range files {
+			if samePath(existing, f) {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			files = append(files, f)
+		}
+	}
+	return files
+}
+
+func rememberRecentFile(file string) {
+	file = cleanRecentPath(file)
+	if file == "" || !isMarkdown(file) {
+		return
+	}
+	recentMu.Lock()
+	defer recentMu.Unlock()
+
+	files := []string{file}
+	for _, f := range loadRecentFiles() {
+		if !samePath(f, file) {
+			files = append(files, f)
+		}
+		if len(files) >= 10 {
+			break
+		}
+	}
+	p := recentFile()
+	if p == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return
+	}
+	b, err := json.MarshalIndent(recentState{Files: files}, "", "  ")
+	if err == nil {
+		os.WriteFile(p, b, 0o644)
+	}
+}
+
+func knownRecentFile(file string) bool {
+	file = cleanRecentPath(file)
+	if file == "" {
+		return false
+	}
+	for _, f := range loadRecentFiles() {
+		if samePath(f, file) {
+			return true
+		}
+	}
+	return false
+}
+
+func helpSource() string {
+	files := loadRecentFiles()
+	if len(files) == 0 {
+		return helpMD
+	}
+	var b strings.Builder
+	b.WriteString(helpMD)
+	b.WriteString("\n\n## 최근 파일\n\n")
+	for _, f := range files {
+		label := template.HTMLEscapeString(filepath.Base(f))
+		full := template.HTMLEscapeString(f)
+		href := "/__mmark/open?p=" + url.QueryEscape(f)
+		fmt.Fprintf(&b, "- <a href=\"%s\">%s</a><br><code>%s</code>\n", href, label, full)
+	}
+	return b.String()
 }
 
 // setTheme stores the user's theme choice; persisting it under the OS config
@@ -479,11 +681,38 @@ func decodeText(b []byte) string {
 	return string(b)
 }
 
-const baseCSS = `.markdown-body{box-sizing:border-box;min-width:200px;max-width:980px;margin:0 auto;padding:45px}
-@media (max-width: 767px){.markdown-body{padding:15px}}
-#theme-toggle{position:fixed;top:12px;right:12px;z-index:10;width:38px;height:38px;border-radius:50%;border:1px solid rgba(128,128,128,.4);background:rgba(128,128,128,.12);cursor:pointer;font-size:18px;line-height:1;padding:0;opacity:.55}
-#theme-toggle:hover{opacity:1}
-@media print{#theme-toggle{display:none}}
+const baseCSS = `:root{color-scheme:light dark}
+*{box-sizing:border-box}
+.markdown-body{min-width:200px;max-width:980px;margin:0 auto;padding:45px}
+#controls{position:fixed;top:12px;right:12px;z-index:30;display:flex;gap:6px}
+#controls button,#search-panel button,.mmark-copy{width:36px;height:36px;border:1px solid rgba(128,128,128,.38);border-radius:8px;background:color-mix(in srgb, Canvas 86%, transparent);color:CanvasText;cursor:pointer;font-size:17px;line-height:1;padding:0;box-shadow:0 2px 10px rgba(0,0,0,.08)}
+#controls button:hover,#search-panel button:hover,.mmark-copy:hover{background:color-mix(in srgb, CanvasText 10%, Canvas);border-color:rgba(128,128,128,.7)}
+#toc{position:fixed;top:62px;left:16px;bottom:16px;z-index:20;width:230px;overflow:auto;padding:10px 8px;border:1px solid rgba(128,128,128,.28);border-radius:8px;background:color-mix(in srgb, Canvas 92%, transparent);backdrop-filter:blur(8px);font-size:13px;line-height:1.35}
+#toc ol{list-style:none;margin:0;padding:0}
+#toc li{margin:0}
+#toc a{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:4px 8px;border-radius:6px;color:inherit;text-decoration:none;opacity:.74}
+#toc a:hover,#toc a.is-active{background:color-mix(in srgb, CanvasText 10%, Canvas);opacity:1}
+#toc .toc-level-2{padding-left:10px}
+#toc .toc-level-3{padding-left:22px}
+#toc .toc-level-4{padding-left:34px}
+body.toc-collapsed #toc{display:none}
+#search-panel{position:fixed;top:58px;right:12px;z-index:40;display:flex;align-items:center;gap:6px;max-width:calc(100vw - 24px);padding:8px;border:1px solid rgba(128,128,128,.34);border-radius:8px;background:color-mix(in srgb, Canvas 94%, transparent);box-shadow:0 8px 28px rgba(0,0,0,.16);backdrop-filter:blur(8px)}
+#search-panel[hidden],#toc[hidden],#toc-toggle[hidden]{display:none!important}
+#search-input{width:min(260px,calc(100vw - 220px));height:36px;border:1px solid rgba(128,128,128,.42);border-radius:8px;background:Canvas;color:CanvasText;padding:0 10px;font:inherit}
+#search-count{min-width:48px;text-align:center;font-size:13px;color:color-mix(in srgb, CanvasText 68%, transparent)}
+.mmark-search-hit{background:#ffe066;color:#111;border-radius:3px;padding:0 .08em}
+.mmark-search-hit.is-active{background:#ff9f1a;color:#111;outline:2px solid rgba(255,159,26,.35)}
+.mmark-code{position:relative}
+.mmark-copy{position:absolute;top:8px;right:8px;opacity:0;width:32px;height:32px;font-size:15px}
+.mmark-code:hover .mmark-copy,.mmark-copy:focus{opacity:1}
+.mmark-mermaid{overflow:auto;margin:16px 0;text-align:center}
+.mmark-mermaid svg{max-width:100%;height:auto}
+.mmark-mermaid.is-error{text-align:left}
+.katex-display{overflow-x:auto;overflow-y:hidden;padding:.2em 0}
+@media (min-width:1261px){body.has-toc:not(.toc-collapsed) #toc{display:block}}
+@media (max-width:1260px){#toc{display:none;right:12px;left:12px;top:58px;bottom:12px;width:auto}body.toc-open #toc{display:block}.markdown-body{padding-top:58px}}
+@media (max-width:767px){.markdown-body{padding:58px 15px 20px}#controls{top:10px;right:10px;gap:4px}#controls button{width:34px;height:34px}#search-panel{left:10px;right:10px;top:54px}#search-input{width:100%;min-width:0}}
+@media print{body{background:#fff!important;color:#000!important}#controls,#search-panel,#toc,.mmark-copy{display:none!important}.markdown-body{max-width:none!important;margin:0!important;padding:0!important;color:#000!important}pre,blockquote,table,img,svg{break-inside:avoid}pre{white-space:pre-wrap}a[href^="http"]::after{content:" (" attr(href) ")";font-size:.85em;color:#555}}
 `
 
 // buildThemeCSS combines one github-markdown-css variant with the matching

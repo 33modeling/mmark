@@ -24,10 +24,16 @@
 
 - GitHub 스타일 마크다운 렌더링 — 표, 체크박스, 취소선, 각주, 자동 링크
 - 코드 블록 문법 하이라이트 (chroma)
+- 코드 블록 복사 버튼
+- 문서 목차 사이드바와 본문 검색
 - 라이트 / 다크 테마 — 기본은 시스템 설정을 따르고, 페이지 우상단 버튼으로 자동 → 라이트 → 다크 전환. 선택은 설정 파일(`%AppData%\mmark\theme`)에 저장되어 다음 실행에도 유지
 - 파일 저장 시 자동 새로고침 — 편집기와 나란히 두고 쓰기 좋음
+- 인쇄/PDF용 스타일
+- 파일을 지정하지 않고 실행하면 Windows 파일 선택창 표시, 최근 파일 목록 제공
 - 문서 기준 상대 경로 이미지·링크 지원, `.md` 링크는 클릭 시 이어서 렌더링
 - 한글 제목 앵커 지원 — `[목차](#사용-방법)` 같은 문서 내 링크가 GitHub와 동일하게 동작
+- Mermaid 다이어그램 렌더링 — <code>```mermaid</code> 코드 블록 지원
+- KaTeX 수식 렌더링 — `$...$`, `$$...$$`, `\(...\)`, `\[...\]`
 - UTF-8 / UTF-16(BOM) / CP949(EUC-KR) 인코딩 자동 감지
 - 완전 오프라인 동작 — 외부 네트워크 접근 없음
 - 문서에 포함된 `<script>`는 CSP로 실행 차단 — 출처가 불분명한 .md를 열어도 안전
@@ -55,4 +61,4 @@ go build -o mmark .
 
 ## 라이선스
 
-[MIT](LICENSE). 내장된 [github-markdown-css](https://github.com/sindresorhus/github-markdown-css)도 MIT 라이선스입니다.
+[MIT](LICENSE). 내장된 [github-markdown-css](https://github.com/sindresorhus/github-markdown-css), [Mermaid](https://github.com/mermaid-js/mermaid), [KaTeX](https://github.com/KaTeX/KaTeX)도 MIT 라이선스입니다.
