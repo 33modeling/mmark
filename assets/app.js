@@ -182,13 +182,88 @@
     });
   }
 
+  function isEscaped(text, index) {
+    var count = 0;
+    for (var i = index - 1; i >= 0 && text.charAt(i) === "\\"; i--) count++;
+    return count % 2 === 1;
+  }
+
+  function isSingleDollar(text, index) {
+    return text.charAt(index) === "$" &&
+      text.charAt(index - 1) !== "$" &&
+      text.charAt(index + 1) !== "$" &&
+      !isEscaped(text, index);
+  }
+
+  function looksLikeInlineMath(source) {
+    var text = source.trim();
+    if (!text || /^\d+(?:[.,]\d+)?$/.test(text)) return false;
+    if (/[\\_^{}=+\-*/<>]|[∑∫√∞≈≠≤≥]/.test(text)) return true;
+    if (/^[A-Za-z](?:\d+)?$/.test(text)) return true;
+    return /[A-Za-z]\s*[=+\-*/^_]|[=+\-*/^_]\s*[A-Za-z0-9]/.test(text);
+  }
+
+  function skipMathTextNode(node) {
+    var el = node.parentElement;
+    while (el && el !== article) {
+      if (/^(SCRIPT|NOSCRIPT|STYLE|TEXTAREA|PRE|CODE|OPTION)$/i.test(el.tagName)) return true;
+      if (el.classList.contains("katex") || el.classList.contains("mmark-mermaid")) return true;
+      el = el.parentElement;
+    }
+    return false;
+  }
+
+  function protectInlineDollarMath(root) {
+    var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode: function (node) {
+        if (!node.nodeValue || node.nodeValue.indexOf("$") < 0 || skipMathTextNode(node)) {
+          return NodeFilter.FILTER_REJECT;
+        }
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    var nodes = [];
+    while (walker.nextNode()) nodes.push(walker.currentNode);
+    nodes.forEach(function (node) {
+      var text = node.nodeValue;
+      var frag = document.createDocumentFragment();
+      var pos = 0;
+      var changed = false;
+      for (var i = 0; i < text.length; i++) {
+        if (!isSingleDollar(text, i)) continue;
+        var end = -1;
+        for (var j = i + 1; j < text.length; j++) {
+          if (text.charAt(j) === "\n") break;
+          if (isSingleDollar(text, j)) {
+            end = j;
+            break;
+          }
+        }
+        if (end < 0) continue;
+        var source = text.slice(i + 1, end);
+        if (!looksLikeInlineMath(source)) {
+          i = end;
+          continue;
+        }
+        if (i > pos) frag.appendChild(document.createTextNode(text.slice(pos, i)));
+        frag.appendChild(document.createTextNode("\\(" + source + "\\)"));
+        pos = end + 1;
+        i = end;
+        changed = true;
+      }
+      if (!changed) return;
+      if (pos < text.length) frag.appendChild(document.createTextNode(text.slice(pos)));
+      node.parentNode.replaceChild(frag, node);
+    });
+  }
+
   function setupMath() {
     if (!window.renderMathInElement) return;
+    protectInlineDollarMath(article);
     window.renderMathInElement(article, {
       delimiters: [
         { left: "$$", right: "$$", display: true },
         { left: "\\[", right: "\\]", display: true },
-        { left: "$", right: "$", display: false },
         { left: "\\(", right: "\\)", display: false }
       ],
       throwOnError: false,
@@ -254,6 +329,13 @@
 
     var marks = [];
     var active = -1;
+    var searchTimer = 0;
+
+    function cancelScheduledSearch() {
+      if (!searchTimer) return;
+      window.clearTimeout(searchTimer);
+      searchTimer = 0;
+    }
 
     function clearMarks() {
       marks.forEach(function (mark) {
@@ -298,6 +380,7 @@
     }
 
     function runSearch() {
+      cancelScheduledSearch();
       clearMarks();
       var query = input.value;
       var lowerQuery = query.toLowerCase();
@@ -316,6 +399,23 @@
       nodes.forEach(function (node) { highlightTextNode(node, query, lowerQuery); });
       if (marks.length) activate(0);
       else counter.textContent = "0/0";
+    }
+
+    function scheduleSearch() {
+      cancelScheduledSearch();
+      if (!input.value) {
+        runSearch();
+        return;
+      }
+      counter.textContent = "...";
+      searchTimer = window.setTimeout(function () {
+        searchTimer = 0;
+        runSearch();
+      }, 120);
+    }
+
+    function flushSearch() {
+      if (searchTimer) runSearch();
     }
 
     function activate(index) {
@@ -340,14 +440,21 @@
 
     function closeSearch() {
       panel.hidden = true;
+      cancelScheduledSearch();
       clearMarks();
       input.value = "";
       counter.textContent = "0/0";
     }
 
-    input.addEventListener("input", runSearch);
-    prevBtn.addEventListener("click", function () { activate(active - 1); });
-    nextBtn.addEventListener("click", function () { activate(active + 1); });
+    input.addEventListener("input", scheduleSearch);
+    prevBtn.addEventListener("click", function () {
+      flushSearch();
+      activate(active - 1);
+    });
+    nextBtn.addEventListener("click", function () {
+      flushSearch();
+      activate(active + 1);
+    });
     closeBtn.addEventListener("click", closeSearch);
     if (openBtn) openBtn.addEventListener("click", openSearch);
 
@@ -371,6 +478,7 @@
       }
       if (!panel.hidden && e.target === input && e.key === "Enter") {
         e.preventDefault();
+        flushSearch();
         activate(active + (e.shiftKey ? -1 : 1));
       }
     });

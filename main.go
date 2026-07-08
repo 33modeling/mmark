@@ -436,7 +436,7 @@ func (s *server) renderMarkdown(w http.ResponseWriter, urlPath, title string, sr
 	// scripts inside untrusted .md files from running on this origin and
 	// reading the served directory; only our nonce'd page script may run.
 	w.Header().Set("Content-Security-Policy",
-		"default-src 'none'; img-src * data: blob:; media-src * data:; font-src 'self' data:; "+
+		"default-src 'none'; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:; "+
 			"style-src 'self' 'unsafe-inline'; script-src 'nonce-"+scriptNonce+"'; "+
 			"connect-src 'self'; base-uri 'none'; form-action 'none'")
 	pageTmpl.Execute(w, pageData{
