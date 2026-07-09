@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/yuin/goldmark/parser"
 )
 
 func TestGitHubIDsKeepKoreanAndDeduplicate(t *testing.T) {
@@ -79,5 +82,66 @@ func TestDecodeTextHandlesCommonWindowsMarkdownEncodings(t *testing.T) {
 	}
 	if got := decodeText([]byte{0xC7, 0xD1, 0xB1, 0xDB}); got != "한글" {
 		t.Fatalf("CP949/EUC-KR decode = %q, want 한글", got)
+	}
+}
+
+func renderMarkdownBodyForTest(t *testing.T, src string) string {
+	t.Helper()
+	var buf bytes.Buffer
+	ctx := parser.NewContext(parser.WithIDs(newGitHubIDs()))
+	if err := md.Convert([]byte(src), &buf, parser.WithContext(ctx)); err != nil {
+		t.Fatalf("Convert() error = %v", err)
+	}
+	return buf.String()
+}
+
+func TestMathDelimitersSurviveMarkdownParsing(t *testing.T) {
+	html := renderMarkdownBodyForTest(t, `Inline \(a*b*c\) and \[x_i = y^2\].`)
+
+	for _, want := range []string{
+		`<span class="mmark-math mmark-math-inline" data-display="false">a*b*c</span>`,
+		`<span class="mmark-math mmark-math-display" data-display="true">x_i = y^2</span>`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("rendered HTML %q does not contain %q", html, want)
+		}
+	}
+	if strings.Contains(html, "<em>") {
+		t.Fatalf("math contents were parsed as Markdown emphasis: %q", html)
+	}
+}
+
+func TestDollarMathIsProtectedBeforeEmphasis(t *testing.T) {
+	html := renderMarkdownBodyForTest(t, `Inline $a*b*c$ and $$\sum_{i=1}^n i$$.`)
+
+	for _, want := range []string{
+		`<span class="mmark-math mmark-math-inline" data-display="false">a*b*c</span>`,
+		`<span class="mmark-math mmark-math-display" data-display="true">\sum_{i=1}^n i</span>`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("rendered HTML %q does not contain %q", html, want)
+		}
+	}
+	if strings.Contains(html, "<em>") {
+		t.Fatalf("math contents were parsed as Markdown emphasis: %q", html)
+	}
+}
+
+func TestDollarMathAvoidsCommonFalsePositives(t *testing.T) {
+	html := renderMarkdownBodyForTest(t, "Cost is $5 and `$x$` stays code.")
+
+	if strings.Contains(html, "mmark-math") {
+		t.Fatalf("non-math dollar text or code span was parsed as math: %q", html)
+	}
+	if !strings.Contains(html, "<code>$x$</code>") {
+		t.Fatalf("code span was not preserved: %q", html)
+	}
+}
+
+func TestDisplayMathDoesNotCrossParagraphBoundary(t *testing.T) {
+	html := renderMarkdownBodyForTest(t, "$$x\n\nnot math\n$$")
+
+	if strings.Contains(html, "mmark-math") {
+		t.Fatalf("display math crossed a paragraph boundary: %q", html)
 	}
 }

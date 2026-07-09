@@ -83,6 +83,7 @@ var scriptNonce = func() string {
 
 var md = goldmark.New(
 	goldmark.WithExtensions(
+		mathExtension{},
 		extension.GFM,
 		extension.Footnote,
 		highlighting.NewHighlighting(
@@ -708,6 +709,8 @@ body.toc-collapsed #toc{display:none}
 .mmark-mermaid{overflow:auto;margin:16px 0;text-align:center}
 .mmark-mermaid svg{max-width:100%;height:auto}
 .mmark-mermaid.is-error{text-align:left}
+.mmark-math-display{display:block;overflow-x:auto;overflow-y:hidden;padding:.2em 0;text-align:center}
+.mmark-math.is-error{color:#d1242f}
 .katex-display{overflow-x:auto;overflow-y:hidden;padding:.2em 0}
 @media (min-width:1261px){body.has-toc:not(.toc-collapsed) #toc{display:block}}
 @media (max-width:1260px){#toc{display:none;right:12px;left:12px;top:58px;bottom:12px;width:auto}body.toc-open #toc{display:block}.markdown-body{padding-top:58px}}

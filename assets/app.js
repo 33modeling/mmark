@@ -207,7 +207,7 @@
     var el = node.parentElement;
     while (el && el !== article) {
       if (/^(SCRIPT|NOSCRIPT|STYLE|TEXTAREA|PRE|CODE|OPTION)$/i.test(el.tagName)) return true;
-      if (el.classList.contains("katex") || el.classList.contains("mmark-mermaid")) return true;
+      if (el.classList.contains("katex") || el.classList.contains("mmark-math") || el.classList.contains("mmark-mermaid")) return true;
       el = el.parentElement;
     }
     return false;
@@ -257,7 +257,27 @@
     });
   }
 
+  function renderProtectedMath() {
+    if (!window.katex) return;
+    Array.prototype.forEach.call(article.querySelectorAll(".mmark-math"), function (node) {
+      if (node.dataset.rendered === "true") return;
+      var source = node.textContent;
+      var display = node.dataset.display === "true";
+      try {
+        window.katex.render(source, node, {
+          displayMode: display,
+          throwOnError: false
+        });
+        node.dataset.rendered = "true";
+      } catch (err) {
+        node.classList.add("is-error");
+        node.title = (err && err.message) ? err.message : String(err);
+      }
+    });
+  }
+
   function setupMath() {
+    renderProtectedMath();
     if (!window.renderMathInElement) return;
     protectInlineDollarMath(article);
     window.renderMathInElement(article, {
@@ -267,7 +287,8 @@
         { left: "\\(", right: "\\)", display: false }
       ],
       throwOnError: false,
-      ignoredTags: ["script", "noscript", "style", "textarea", "pre", "code", "option"]
+      ignoredTags: ["script", "noscript", "style", "textarea", "pre", "code", "option"],
+      ignoredClasses: ["katex", "mmark-math", "mmark-mermaid"]
     });
   }
 
