@@ -138,10 +138,75 @@ func TestDollarMathAvoidsCommonFalsePositives(t *testing.T) {
 	}
 }
 
-func TestDisplayMathDoesNotCrossParagraphBoundary(t *testing.T) {
-	html := renderMarkdownBodyForTest(t, "$$x\n\nnot math\n$$")
+func TestDisplayMathBlockAllowsBlankLines(t *testing.T) {
+	html := renderMarkdownBodyForTest(t, "$$\nJ(\\theta_T) = J(\\theta_0)\n\n+ \\sum_i I(z_i)\n$$\n")
 
-	if strings.Contains(html, "mmark-math") {
-		t.Fatalf("display math crossed a paragraph boundary: %q", html)
+	if strings.Count(html, "mmark-math-display") != 1 {
+		t.Fatalf("blank line split the display math block: %q", html)
+	}
+	if strings.Contains(html, "<ul>") || strings.Contains(html, "<em>") {
+		t.Fatalf("display math contents were re-parsed as Markdown: %q", html)
+	}
+}
+
+func TestDisplayMathBlockSurvivesListLikeLines(t *testing.T) {
+	html := renderMarkdownBodyForTest(t,
+		"$$\n\\begin{aligned}\n- x &= 1 \\\\\n1. + y &= 2\n\\end{aligned}\n$$\n")
+
+	if strings.Count(html, "mmark-math-display") != 1 {
+		t.Fatalf("list-marker lines split the display math block: %q", html)
+	}
+	if strings.Contains(html, "<ul>") || strings.Contains(html, "<ol>") {
+		t.Fatalf("display math lines were parsed as lists: %q", html)
+	}
+	if !strings.Contains(html, `\begin{aligned}`) {
+		t.Fatalf("math source was mangled: %q", html)
+	}
+}
+
+func TestDisplayMathBlockOpenerAndCloserMayCarryContent(t *testing.T) {
+	html := renderMarkdownBodyForTest(t, "$$\\begin{aligned}\na &= b\n\\end{aligned} $$\n")
+
+	if strings.Count(html, "mmark-math-display") != 1 {
+		t.Fatalf("content on the $$ opener/closer lines broke the block: %q", html)
+	}
+	for _, want := range []string{`\begin{aligned}`, `\end{aligned}`} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("rendered HTML %q lost math content %q", html, want)
+		}
+	}
+}
+
+func TestSingleLineDoubleDollarStaysInline(t *testing.T) {
+	html := renderMarkdownBodyForTest(t, "앞 $$E=mc^2$$ 뒤.")
+
+	if !strings.Contains(html, `data-display="true">E=mc^2</span>`) {
+		t.Fatalf("single-line $$...$$ was not parsed as display math: %q", html)
+	}
+	if !strings.Contains(html, "앞") || !strings.Contains(html, "뒤") {
+		t.Fatalf("surrounding text was lost: %q", html)
+	}
+}
+
+func TestTableCellMathUnescapesPipes(t *testing.T) {
+	html := renderMarkdownBodyForTest(t,
+		"| 항목 | 수식 |\n|---|---|\n| 조건부 | $P(a\\|b)$ |\n")
+
+	if !strings.Contains(html, "P(a|b)") {
+		t.Fatalf("escaped pipe was not normalized inside table-cell math: %q", html)
+	}
+	if strings.Contains(html, `P(a\|b)`) {
+		t.Fatalf("math still contains the raw \\| escape: %q", html)
+	}
+	if c := strings.Count(html, "<td>"); c != 2 {
+		t.Fatalf("table lost its cell structure (%d cells): %q", c, html)
+	}
+}
+
+func TestPipeOutsideTableCellIsKeptInMath(t *testing.T) {
+	html := renderMarkdownBodyForTest(t, `본문 $\|x\|$ 노름.`)
+
+	if !strings.Contains(html, `\|x\|`) {
+		t.Fatalf("\\| outside a table was rewritten: %q", html)
 	}
 }

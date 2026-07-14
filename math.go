@@ -8,6 +8,7 @@ import (
 
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/ast"
+	extast "github.com/yuin/goldmark/extension/ast"
 	"github.com/yuin/goldmark/parser"
 	"github.com/yuin/goldmark/renderer"
 	"github.com/yuin/goldmark/text"
@@ -39,16 +40,84 @@ func (n *mathNode) Dump(source []byte, level int) {
 	}, nil)
 }
 
+var kindMathBlock = ast.NewNodeKind("MathBlock")
+
+// mathBlockNode holds a fenced $$ ... $$ display-math block. Treating it as a
+// raw block (like a fenced code block) keeps blank lines, list-marker lines
+// (`- x &= 1`), and `1.`-style lines inside the math from being re-parsed as
+// Markdown structure, which is what used to tear display equations apart.
+type mathBlockNode struct {
+	ast.BaseBlock
+}
+
+func (n *mathBlockNode) Kind() ast.NodeKind { return kindMathBlock }
+func (n *mathBlockNode) IsRaw() bool        { return true }
+
+func (n *mathBlockNode) Dump(source []byte, level int) {
+	ast.DumpHelper(n, source, level, nil, nil)
+}
+
 type mathExtension struct{}
 
 func (e mathExtension) Extend(m goldmark.Markdown) {
-	m.Parser().AddOptions(parser.WithInlineParsers(
-		util.Prioritized(mathParser{}, 150),
-	))
+	m.Parser().AddOptions(
+		parser.WithBlockParsers(
+			util.Prioritized(mathBlockParser{}, 850),
+		),
+		parser.WithInlineParsers(
+			util.Prioritized(mathParser{}, 150),
+		),
+	)
 	m.Renderer().AddOptions(renderer.WithNodeRenderers(
 		util.Prioritized(mathHTMLRenderer{}, 500),
 	))
 }
+
+// mathBlockParser opens on a line starting with `$$` and consumes lines with
+// code-fence semantics until a line ending in `$$`.
+type mathBlockParser struct{}
+
+func (p mathBlockParser) Trigger() []byte { return []byte{'$'} }
+
+func (p mathBlockParser) Open(_ ast.Node, reader text.Reader, pc parser.Context) (ast.Node, parser.State) {
+	line, segment := reader.PeekLine()
+	pos := pc.BlockOffset()
+	if pos < 0 || pos+1 >= len(line) || line[pos] != '$' || line[pos+1] != '$' {
+		return nil, parser.NoChildren
+	}
+	rest := line[pos+2:]
+	// `$$x$$ ...` on one line stays with the inline parser.
+	if bytes.Contains(rest, []byte("$$")) {
+		return nil, parser.NoChildren
+	}
+	node := &mathBlockNode{}
+	if len(bytes.TrimSpace(rest)) > 0 {
+		node.Lines().Append(text.NewSegment(segment.Start+pos+2, segment.Stop))
+	}
+	reader.Advance(segment.Len() - 1)
+	return node, parser.NoChildren
+}
+
+func (p mathBlockParser) Continue(node ast.Node, reader text.Reader, _ parser.Context) parser.State {
+	line, segment := reader.PeekLine()
+	trimmed := util.TrimRightSpace(line)
+	if l := len(trimmed); l >= 2 && trimmed[l-1] == '$' && trimmed[l-2] == '$' &&
+		!isEscapedByte(trimmed, l-2) {
+		if len(bytes.TrimSpace(trimmed[:l-2])) > 0 {
+			node.Lines().Append(text.NewSegment(segment.Start, segment.Start+l-2))
+		}
+		reader.Advance(segment.Len() - 1)
+		return parser.Close
+	}
+	node.Lines().Append(segment)
+	return parser.Continue | parser.NoChildren
+}
+
+func (p mathBlockParser) Close(ast.Node, text.Reader, parser.Context) {}
+
+func (p mathBlockParser) CanInterruptParagraph() bool { return true }
+
+func (p mathBlockParser) CanAcceptIndentedLine() bool { return false }
 
 type mathParser struct{}
 
@@ -56,28 +125,47 @@ func (p mathParser) Trigger() []byte {
 	return []byte{'$', '\\'}
 }
 
-func (p mathParser) Parse(_ ast.Node, block text.Reader, _ parser.Context) ast.Node {
+func (p mathParser) Parse(parent ast.Node, block text.Reader, _ parser.Context) ast.Node {
 	line, segment := block.PeekLine()
 	if len(line) == 0 {
 		return nil
 	}
 	src := block.Source()
 	start := segment.Start
+	var node ast.Node
 	switch line[0] {
 	case '$':
-		return parseDollarMath(block, src, start)
+		node = parseDollarMath(block, src, start)
 	case '\\':
 		if len(line) < 2 {
 			return nil
 		}
 		switch line[1] {
 		case '(':
-			return parseBackslashMath(block, src, start, ')', false)
+			node = parseBackslashMath(block, src, start, ')', false)
 		case '[':
-			return parseBackslashMath(block, src, start, ']', true)
+			node = parseBackslashMath(block, src, start, ']', true)
 		}
 	}
-	return nil
+	return normalizeTableCellMath(parent, node)
+}
+
+// normalizeTableCellMath rewrites `\|` to `|` for math inside a table cell.
+// GFM requires pipes in cells to be escaped as `\|` to avoid splitting the
+// row, but the escape reaches the math source verbatim and KaTeX would render
+// it as ‖ (\Vert). GitHub unescapes it the same way.
+func normalizeTableCellMath(parent ast.Node, node ast.Node) ast.Node {
+	if node == nil {
+		return nil
+	}
+	for n := parent; n != nil; n = n.Parent() {
+		if n.Kind() == extast.KindTableCell {
+			m := node.(*mathNode)
+			m.value = bytes.ReplaceAll(m.value, []byte(`\|`), []byte(`|`))
+			break
+		}
+	}
+	return node
 }
 
 func parseDollarMath(block text.Reader, src []byte, start int) ast.Node {
@@ -274,6 +362,23 @@ type mathHTMLRenderer struct{}
 
 func (r mathHTMLRenderer) RegisterFuncs(reg renderer.NodeRendererFuncRegisterer) {
 	reg.Register(kindMath, r.renderMath)
+	reg.Register(kindMathBlock, r.renderMathBlock)
+}
+
+func (r mathHTMLRenderer) renderMathBlock(w util.BufWriter, source []byte, n ast.Node, entering bool) (ast.WalkStatus, error) {
+	if !entering {
+		return ast.WalkContinue, nil
+	}
+	var buf bytes.Buffer
+	lines := n.Lines()
+	for i := 0; i < lines.Len(); i++ {
+		s := lines.At(i)
+		buf.Write(s.Value(source))
+	}
+	_, _ = w.WriteString(`<span class="mmark-math mmark-math-display" data-display="true">`)
+	_, _ = w.WriteString(stdhtml.EscapeString(buf.String()))
+	_, _ = w.WriteString(`</span>` + "\n")
+	return ast.WalkSkipChildren, nil
 }
 
 func (r mathHTMLRenderer) renderMath(w util.BufWriter, _ []byte, n ast.Node, entering bool) (ast.WalkStatus, error) {
