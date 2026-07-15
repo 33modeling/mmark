@@ -1,3 +1,5 @@
+<img src="assets/icon.svg" width="96" align="right" alt="mmark 아이콘">
+
 # mmark
 
 윈도우에서 설치 없이 쓰는 초간단 마크다운 뷰어. `mmark.exe` 파일 하나가 전부입니다.

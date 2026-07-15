@@ -132,6 +132,7 @@ var pageTmpl = template.Must(template.New("page").Parse(`<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{.Title}} · mmark</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%230ea5e9'/%3E%3Cstop offset='1' stop-color='%236366f1'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect x='6' y='6' width='88' height='88' rx='20' fill='url(%23g)'/%3E%3Cpath d='M22 70V33l14 16 14-16v37' stroke='white' stroke-width='9' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M72 32v26m-11-11l11 13 11-13' stroke='white' stroke-width='9' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/__mmark/assets/katex.min.css">
 <style>{{.BaseCSS}}</style>
 <style id="css-light" media="{{.LightMedia}}">{{.LightCSS}}</style>
@@ -682,40 +683,48 @@ func decodeText(b []byte) string {
 	return string(b)
 }
 
-const baseCSS = `:root{color-scheme:light dark}
+const baseCSS = `:root{color-scheme:light dark;--mm-accent:#6366f1;--mm-ring:rgba(99,102,241,.3)}
 *{box-sizing:border-box}
-.markdown-body{min-width:200px;max-width:980px;margin:0 auto;padding:45px}
+html{scroll-behavior:smooth}
+@keyframes mm-fade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+@keyframes mm-drop{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}
+.markdown-body{min-width:200px;max-width:980px;margin:0 auto;padding:45px;animation:mm-fade .3s ease}
 #controls{position:fixed;top:12px;right:12px;z-index:30;display:flex;gap:6px}
-#controls button,#search-panel button,.mmark-copy{width:36px;height:36px;border:1px solid rgba(128,128,128,.38);border-radius:8px;background:color-mix(in srgb, Canvas 86%, transparent);color:CanvasText;cursor:pointer;font-size:17px;line-height:1;padding:0;box-shadow:0 2px 10px rgba(0,0,0,.08)}
-#controls button:hover,#search-panel button:hover,.mmark-copy:hover{background:color-mix(in srgb, CanvasText 10%, Canvas);border-color:rgba(128,128,128,.7)}
-#toc{position:fixed;top:62px;left:16px;bottom:16px;z-index:20;width:230px;overflow:auto;padding:10px 8px;border:1px solid rgba(128,128,128,.28);border-radius:8px;background:color-mix(in srgb, Canvas 92%, transparent);backdrop-filter:blur(8px);font-size:13px;line-height:1.35}
+#controls button,#search-panel button,.mmark-copy{width:38px;height:38px;border:1px solid rgba(128,128,128,.3);border-radius:11px;background:color-mix(in srgb, Canvas 82%, transparent);color:CanvasText;cursor:pointer;font-size:17px;line-height:1;padding:0;box-shadow:0 2px 10px rgba(0,0,0,.08);backdrop-filter:blur(10px);transition:border-color .15s ease,background .15s ease,transform .12s ease,box-shadow .15s ease}
+#controls button:hover,#search-panel button:hover,.mmark-copy:hover{background:color-mix(in srgb, CanvasText 8%, Canvas);border-color:var(--mm-accent);transform:translateY(-1px);box-shadow:0 4px 14px rgba(0,0,0,.12)}
+#controls button:active,#search-panel button:active,.mmark-copy:active{transform:scale(.93)}
+#toc{position:fixed;top:62px;left:16px;bottom:16px;z-index:20;width:236px;overflow:auto;padding:10px 8px;border:1px solid rgba(128,128,128,.24);border-radius:13px;background:color-mix(in srgb, Canvas 90%, transparent);backdrop-filter:blur(10px);font-size:13px;line-height:1.35;box-shadow:0 6px 24px rgba(0,0,0,.07);animation:mm-fade .3s ease}
 #toc ol{list-style:none;margin:0;padding:0}
 #toc li{margin:0}
-#toc a{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:4px 8px;border-radius:6px;color:inherit;text-decoration:none;opacity:.74}
-#toc a:hover,#toc a.is-active{background:color-mix(in srgb, CanvasText 10%, Canvas);opacity:1}
+#toc a{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:4px 9px;border-radius:7px;color:inherit;text-decoration:none;opacity:.72;transition:background .15s ease,opacity .15s ease,box-shadow .15s ease}
+#toc a:hover{background:color-mix(in srgb, CanvasText 8%, Canvas);opacity:1}
+#toc a.is-active{background:color-mix(in srgb, var(--mm-accent) 14%, Canvas);box-shadow:inset 3px 0 0 var(--mm-accent);opacity:1}
 #toc .toc-level-2{padding-left:10px}
 #toc .toc-level-3{padding-left:22px}
 #toc .toc-level-4{padding-left:34px}
 body.toc-collapsed #toc{display:none}
-#search-panel{position:fixed;top:58px;right:12px;z-index:40;display:flex;align-items:center;gap:6px;max-width:calc(100vw - 24px);padding:8px;border:1px solid rgba(128,128,128,.34);border-radius:8px;background:color-mix(in srgb, Canvas 94%, transparent);box-shadow:0 8px 28px rgba(0,0,0,.16);backdrop-filter:blur(8px)}
+#search-panel{position:fixed;top:60px;right:12px;z-index:40;display:flex;align-items:center;gap:6px;max-width:calc(100vw - 24px);padding:8px;border:1px solid rgba(128,128,128,.3);border-radius:13px;background:color-mix(in srgb, Canvas 92%, transparent);box-shadow:0 10px 32px rgba(0,0,0,.16);backdrop-filter:blur(10px);animation:mm-drop .18s ease}
 #search-panel[hidden],#toc[hidden],#toc-toggle[hidden]{display:none!important}
-#search-input{width:min(260px,calc(100vw - 220px));height:36px;border:1px solid rgba(128,128,128,.42);border-radius:8px;background:Canvas;color:CanvasText;padding:0 10px;font:inherit}
+#search-input{width:min(260px,calc(100vw - 220px));height:38px;border:1px solid rgba(128,128,128,.38);border-radius:10px;background:Canvas;color:CanvasText;padding:0 11px;font:inherit;outline:none;transition:border-color .15s ease,box-shadow .15s ease}
+#search-input:focus{border-color:var(--mm-accent);box-shadow:0 0 0 3px var(--mm-ring)}
 #search-count{min-width:48px;text-align:center;font-size:13px;color:color-mix(in srgb, CanvasText 68%, transparent)}
 .mmark-search-hit{background:#ffe066;color:#111;border-radius:3px;padding:0 .08em}
 .mmark-search-hit.is-active{background:#ff9f1a;color:#111;outline:2px solid rgba(255,159,26,.35)}
 .mmark-code{position:relative}
-.mmark-copy{position:absolute;top:8px;right:8px;opacity:0;width:32px;height:32px;font-size:15px}
-.mmark-code:hover .mmark-copy,.mmark-copy:focus{opacity:1}
-.mmark-mermaid{overflow:auto;margin:16px 0;text-align:center}
+.mmark-copy{position:absolute;top:8px;right:8px;opacity:0;width:32px;height:32px;font-size:15px;transform:translateY(-2px);transition:opacity .15s ease,transform .15s ease,border-color .15s ease,background .15s ease}
+.mmark-code:hover .mmark-copy,.mmark-copy:focus{opacity:1;transform:none}
+.mmark-mermaid{overflow:auto;margin:16px 0;text-align:center;transition:opacity .2s ease}
+.mmark-mermaid.is-rendering{opacity:.35}
 .mmark-mermaid svg{max-width:100%;height:auto}
 .mmark-mermaid.is-error{text-align:left}
 .mmark-math-display{display:block;overflow-x:auto;overflow-y:hidden;padding:.2em 0;text-align:center}
 .mmark-math.is-error{color:#d1242f}
 .katex-display{overflow-x:auto;overflow-y:hidden;padding:.2em 0}
 @media (min-width:1261px){body.has-toc:not(.toc-collapsed) #toc{display:block}}
-@media (max-width:1260px){#toc{display:none;right:12px;left:12px;top:58px;bottom:12px;width:auto}body.toc-open #toc{display:block}.markdown-body{padding-top:58px}}
+@media (max-width:1260px){#toc{display:none;right:12px;left:12px;top:58px;bottom:12px;width:auto}body.toc-open #toc{display:block;animation:mm-drop .18s ease}.markdown-body{padding-top:58px}}
 @media (max-width:767px){.markdown-body{padding:58px 15px 20px}#controls{top:10px;right:10px;gap:4px}#controls button{width:34px;height:34px}#search-panel{left:10px;right:10px;top:54px}#search-input{width:100%;min-width:0}}
 @media print{body{background:#fff!important;color:#000!important}#controls,#search-panel,#toc,.mmark-copy{display:none!important}.markdown-body{max-width:none!important;margin:0!important;padding:0!important;color:#000!important}pre,blockquote,table,img,svg{break-inside:avoid}pre{white-space:pre-wrap}a[href^="http"]::after{content:" (" attr(href) ")";font-size:.85em;color:#555}}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}html{scroll-behavior:auto}}
 `
 
 // buildThemeCSS combines one github-markdown-css variant with the matching
